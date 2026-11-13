@@ -238,7 +238,7 @@ public class ClientScopeEvaluateResource {
 
         UserModel user = getUserModel(userId);
 
-        logger.debugf("generateExampleIdToken invoked. User: %s, Scope param: %s, Target Audience: %s", user.getUsername(), scopeParam);
+        logger.debugf("generateExampleIdToken invoked. User: %s, Scope param: %s, Target Audience: %s", user.getUsername(), scopeParam, audience);
 
         return sessionAware(OIDCLoginProtocol.LOGIN_PROTOCOL, user, scopeParam, audience, (userSession, clientSessionCtx, audienceClients, authSession) ->
         {
@@ -384,11 +384,11 @@ public class ClientScopeEvaluateResource {
             return function.generateProtocolResponse(userSession, clientSessionCtx, audienceClients, authSession);
 
         } finally {
-            if (authSession != null) {
-                authSessionManager.removeAuthenticationSession(realm, authSession, false);
-            }
             if (userSession != null) {
-                session.sessions().removeUserSession(realm, userSession);
+                AuthenticationManager.removeUserSessionAndRootAuthSession(session, realm, userSession);
+            } else if (authSession != null) {
+                // userSession was never created; clean up the root auth session on its own
+                authSessionManager.removeAuthenticationSession(realm, authSession, false);
             }
         }
     }

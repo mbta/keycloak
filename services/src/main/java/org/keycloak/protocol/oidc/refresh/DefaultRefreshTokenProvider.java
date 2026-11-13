@@ -26,6 +26,7 @@ import org.keycloak.models.utils.SessionExpirationUtils;
 import org.keycloak.protocol.oidc.TokenManager;
 import org.keycloak.representations.AccessToken;
 import org.keycloak.representations.RefreshToken;
+import org.keycloak.services.managers.AuthenticationManager;
 import org.keycloak.services.managers.UserSessionManager;
 import org.keycloak.util.TokenUtil;
 
@@ -58,9 +59,7 @@ public class DefaultRefreshTokenProvider extends AbstractRefreshTokenProvider im
         userSession.setLastSessionRefresh(refreshToken.getIat().intValue());
         if (initialRefreshTokenCtx.offlineTokenRequested()) {
             refreshToken.type(TokenUtil.TOKEN_TYPE_OFFLINE);
-            if (userSession.getRealm().isOfflineSessionMaxLifespanEnabled()) {
-                refreshToken.exp(getExpiration(clientSessionCtx, userSession,true));
-            }
+            refreshToken.exp(getExpiration(clientSessionCtx, userSession, true));
             responseBuilder.createOrUpdateOfflineSession();
         } else {
             refreshToken.exp(getExpiration(clientSessionCtx, userSession, false));
@@ -99,26 +98,35 @@ public class DefaultRefreshTokenProvider extends AbstractRefreshTokenProvider im
     @Override
     public void revokeToken(AccessToken token, UserModel user, ClientModel client, EventBuilder event) {
         RealmModel realm = session.getContext().getRealm();
+        String onlineUserSessionId = null;
 
         if (TokenUtil.TOKEN_TYPE_OFFLINE.equals(token.getType())) {
             UserSessionModel userSession = session.sessions().getOfflineUserSession(realm, token.getSessionId());
             if (userSession != null) {
+                onlineUserSessionId = userSession.getNote(UserSessionModel.CORRESPONDING_SESSION_ID);
                 new UserSessionManager(session).removeClientFromOfflineUserSession(realm, userSession, client, user);
             }
         }
+
+        if (onlineUserSessionId == null) {
+            onlineUserSessionId = token.getSessionId();
+        }
+
         // Always remove "online" session as well if exists to make sure that issued access-tokens are revoked as well
-        UserSessionModel userSession = session.sessions().getUserSession(realm, token.getSessionId());
+        UserSessionModel userSession = session.sessions().getUserSession(realm, onlineUserSessionId);
         if (userSession != null) {
             AuthenticatedClientSessionModel clientSession = userSession.getAuthenticatedClientSessionByClient(client.getId());
             if (clientSession != null) {
                 revokeTokenExchangeSession(userSession, token, event);
 
                 TokenManager.detachClientSession(clientSession);
+            }
 
-                // TODO: Might need optimization to prevent loading client sessions from cache in getAuthenticatedClientSessions()
-                if (userSession.getAuthenticatedClientSessions().isEmpty()) {
-                    session.sessions().removeUserSession(realm, userSession);
-                }
+            // Remove the user session (and the root auth session sharing its id) once it has no client sessions left,
+            // even if this client had no client session in it.
+            // TODO: Might need optimization to prevent loading client sessions from cache in getAuthenticatedClientSessions()
+            if (userSession.getAuthenticatedClientSessions().isEmpty()) {
+                AuthenticationManager.removeUserSessionAndRootAuthSession(session, realm, userSession);
             }
         }
     }
@@ -155,6 +163,11 @@ public class DefaultRefreshTokenProvider extends AbstractRefreshTokenProvider im
                 TimeUnit.SECONDS.toMillis(userSession.getStarted()),
                 realm, client);
         expiration = lifespan > 0? Math.min(expiration, lifespan) : expiration;
+        long userSessionIdle = SessionExpirationUtils.calculateUserSessionIdleTimestamp(
+                offline, userSession.isRememberMe(),
+                TimeUnit.SECONDS.toMillis(userSession.getLastSessionRefresh()),
+                realm);
+        expiration = Math.min(expiration, userSessionIdle);
 
         return TimeUnit.MILLISECONDS.toSeconds(expiration);
     }

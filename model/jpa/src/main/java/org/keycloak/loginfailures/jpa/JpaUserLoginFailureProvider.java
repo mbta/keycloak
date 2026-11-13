@@ -25,17 +25,23 @@ import java.util.Set;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.LockModeType;
 
+import org.keycloak.common.util.Time;
 import org.keycloak.connections.jpa.JpaConnectionProvider;
+import org.keycloak.connections.jpa.util.JpaUtils;
 import org.keycloak.models.KeycloakSession;
+import org.keycloak.models.ModelException;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserLoginFailureModel;
 import org.keycloak.models.UserLoginFailureProvider;
+import org.keycloak.models.utils.LoginFailureUtils;
 
 public class JpaUserLoginFailureProvider implements UserLoginFailureProvider {
 
+    private static final int MAX_ADD_ATTEMPTS = 5;
+
     private final KeycloakSession session;
     private final Set<LoginFailureKey> notInDatabaseCache = new HashSet<>();
-    private final Map<LoginFailureKey, UserLoginFailureModel> entityInSession = new HashMap();
+    private final Map<LoginFailureKey, UserLoginFailureModel> entityInSession = new HashMap<>();
 
     public JpaUserLoginFailureProvider(KeycloakSession session) {
         this.session = session;
@@ -61,24 +67,66 @@ public class JpaUserLoginFailureProvider implements UserLoginFailureProvider {
             notInDatabaseCache.add(key);
             return null;
         }
-        model = new UserLoginFailureAdapter(em, entity);
+        if (isExpired(realm, entity)) {
+            // leave the clean-up to the background task to avoid concurrent updates to the database
+            // Do not retain the expired entity in the persistence context. addUserLoginFailure() must reload it
+            // with a pessimistic lock if another failure is recorded in this transaction.
+            em.detach(entity);
+            notInDatabaseCache.add(key);
+            return null;
+        }
+        model = new UserLoginFailureAdapter(em, entity, false);
         entityInSession.put(key, model);
         return model;
+    }
+
+    private boolean isExpired(RealmModel realm, LoginFailureEntity entity) {
+        if (entity.getLastFailure() == 0) {
+            // Entry was cleared after a successful login — treat as expired, matching Infinispan TTL=0 behavior.
+            return true;
+        }
+
+        long expireMs = LoginFailureUtils.computeExpirationCutOffTimestampMillis(realm, Time.currentTimeMillis());
+        return expireMs != -1 && entity.getLastFailure() < expireMs;
+    }
+
+    @Override
+    public void updateWithLatestRealmSettings(RealmModel realm) {
+        if (!realm.isBruteForceProtected()) {
+            removeAllUserLoginFailures(realm);
+        }
     }
 
     @Override
     public UserLoginFailureModel addUserLoginFailure(RealmModel realm, String userId) {
         var em = getEntityManager();
-        em.createNamedQuery("insertLoginFailure")
-                .setParameter("realmId", realm.getId())
-                .setParameter("userId", userId)
-                .executeUpdate();
         var key = new LoginFailureKey(realm.getId(), userId);
         notInDatabaseCache.remove(key);
-        var entity = em.find(LoginFailureEntity.class, key);
-        UserLoginFailureModel model = new UserLoginFailureAdapter(em, entity);
-        entityInSession.put(key, model);
-        return model;
+        // INSERT ON CONFLICT DO NOTHING does not lock the conflicting row, so a concurrent DELETE
+        // could remove it between the INSERT and the subsequent find. Retry if this happens.
+        // One retry should normally be sufficient for that race; allow five attempts as an extra safety
+        // margin while ensuring an unexpected database behavior cannot retain resources until the transaction timeout.
+        for (int attempt = 0; attempt < MAX_ADD_ATTEMPTS; attempt++) {
+            int rows = em.createNamedQuery("insertLoginFailure")
+                    .setParameter("realmId", realm.getId())
+                    .setParameter("userId", userId)
+                    .executeUpdate();
+            boolean inserted = !JpaUtils.isUpsertRowCountUnreliable(em) && rows > 0;
+            // On MySQL/MariaDB, a pessimistic lock performs a current read instead of consulting the
+            // repeatable-read snapshot, allowing it to see a concurrently inserted row after it commits.
+            LoginFailureEntity entity = inserted
+                    ? em.find(LoginFailureEntity.class, key)
+                    : em.find(LoginFailureEntity.class, key, LockModeType.PESSIMISTIC_WRITE);
+            if (entity != null) {
+                UserLoginFailureModel model = new UserLoginFailureAdapter(em, entity, !inserted);
+                if (!inserted && isExpired(realm, entity)) {
+                    model.clearPrimaryAndSecondaryAuthFailures();
+                }
+                entityInSession.put(key, model);
+                return model;
+            }
+        }
+        throw new ModelException("Unable to add login failure after " + MAX_ADD_ATTEMPTS + " attempts");
     }
 
     @Override

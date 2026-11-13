@@ -74,6 +74,7 @@ import org.keycloak.events.Details;
 import org.keycloak.events.Errors;
 import org.keycloak.events.EventBuilder;
 import org.keycloak.events.EventType;
+import org.keycloak.forms.login.LoginFormsProvider;
 import org.keycloak.keys.PublicKeyLoader;
 import org.keycloak.keys.PublicKeyStorageProvider;
 import org.keycloak.keys.PublicKeyStorageUtils;
@@ -258,7 +259,11 @@ public class SAMLEndpoint {
         protected abstract String getBindingType();
         protected abstract boolean containsUnencryptedSignature(SAMLDocumentHolder documentHolder);
         protected abstract boolean isMessageFullySigned(SAMLDocumentHolder documentHolder);
-        protected abstract void verifySignature(String key, SAMLDocumentHolder documentHolder) throws VerificationException;
+        /**
+         * @param message the SAML message being processed, as received in the {@code key} parameter
+         * @param relayState the relay state being processed
+         */
+        protected abstract void verifySignature(String key, SAMLDocumentHolder documentHolder, String message, String relayState) throws VerificationException;
         protected abstract SAMLDocumentHolder extractRequestDocument(String samlRequest);
         protected abstract SAMLDocumentHolder extractResponseDocument(String response);
 
@@ -325,7 +330,7 @@ public class SAMLEndpoint {
             }
             if (config.isValidateSignature()) {
                 try {
-                    verifySignature(GeneralConstants.SAML_REQUEST_KEY, holder);
+                    verifySignature(GeneralConstants.SAML_REQUEST_KEY, holder, samlRequest, relayState);
                 } catch (VerificationException e) {
                     logger.error("validation failed", e);
                     event.event(EventType.IDENTITY_PROVIDER_RESPONSE);
@@ -392,10 +397,19 @@ public class SAMLEndpoint {
                 }
             }
 
+            String logoutServiceUrl = config.getSingleLogoutServiceUrl();
+            if (StringUtil.isBlank(logoutServiceUrl)) {
+                logger.debugf("IdP '%s' has no Single Logout Service URL; skipping LogoutResponse", config.getAlias());
+                event.success();
+                return session.getProvider(LoginFormsProvider.class)
+                        .setSuccess(Messages.SUCCESS_LOGOUT)
+                        .createInfoPage();
+            }
+
             String issuerURL = getEntityId(session.getContext().getUri(), realm);
             SAML2LogoutResponseBuilder builder = new SAML2LogoutResponseBuilder();
             builder.logoutRequestID(request.getID());
-            builder.destination(config.getSingleLogoutServiceUrl());
+            builder.destination(logoutServiceUrl);
             builder.issuer(issuerURL);
             JaxrsSAML2BindingBuilder binding = new JaxrsSAML2BindingBuilder(session)
                         .relayState(relayState);
@@ -412,9 +426,9 @@ public class SAMLEndpoint {
             }
             try {
                 if (postBinding) {
-                    return binding.postBinding(builder.buildDocument()).response(config.getSingleLogoutServiceUrl());
+                    return binding.postBinding(builder.buildDocument()).response(logoutServiceUrl);
                 } else {
-                    return binding.redirectBinding(builder.buildDocument()).response(config.getSingleLogoutServiceUrl());
+                    return binding.redirectBinding(builder.buildDocument()).response(logoutServiceUrl);
                 }
             } catch (ConfigurationException e) {
                 throw new RuntimeException(e);
@@ -443,7 +457,7 @@ public class SAMLEndpoint {
                 // validate the signature of the ArtifactResponse
                 if (config.isValidateSignature()) {
                     try {
-                        verifySignature(GeneralConstants.SAML_RESPONSE_KEY, samlDocumentHolder);
+                        verifySignature(GeneralConstants.SAML_RESPONSE_KEY, samlDocumentHolder, null, relayState);
                     } catch (VerificationException e) {
                         logger.error("artifact binding failed: the ArtifactResponse signature is invalid", e);
                         event.event(EventType.IDENTITY_PROVIDER_RESPONSE);
@@ -672,7 +686,8 @@ public class SAMLEndpoint {
                 }
 
                 ConditionsValidator.Builder cvb = new ConditionsValidator.Builder(assertion.getID(), assertion.getConditions(), destinationValidator)
-                        .clockSkewInMillis(1000 * config.getAllowedClockSkew());
+                        .clockSkewInMillis(1000 * config.getAllowedClockSkew())
+                        .rejectProxyRestriction(config.isProxyRestrictionValidationEnabled());
                 try {
                     String issuerURL = getEntityId(session.getContext().getUri(), realm);
                     cvb.addAllowedAudience(URI.create(issuerURL));
@@ -791,7 +806,7 @@ public class SAMLEndpoint {
             }
             if (config.isValidateSignature()) {
                 try {
-                    verifySignature(GeneralConstants.SAML_RESPONSE_KEY, holder);
+                    verifySignature(GeneralConstants.SAML_RESPONSE_KEY, holder, samlResponse, relayState);
                 } catch (VerificationException e) {
                     logger.error("validation failed", e);
                     event.event(EventType.IDENTITY_PROVIDER_RESPONSE);
@@ -854,7 +869,7 @@ public class SAMLEndpoint {
         }
 
         @Override
-        protected void verifySignature(String key, SAMLDocumentHolder documentHolder) throws VerificationException {
+        protected void verifySignature(String key, SAMLDocumentHolder documentHolder, String message, String relayState) throws VerificationException {
             if ((! containsUnencryptedSignature(documentHolder)) && (documentHolder.getSamlObject() instanceof ResponseType)) {
                 ResponseType responseType = (ResponseType) documentHolder.getSamlObject();
                 List<ResponseType.RTChoiceType> assertions = responseType.getAssertions();
@@ -885,6 +900,23 @@ public class SAMLEndpoint {
 
     protected class RedirectBinding extends Binding {
         @Override
+        protected Response basicChecks(String samlRequest, String samlResponse, String samlArt) {
+            Response response = super.basicChecks(samlRequest, samlResponse, samlArt);
+            if (response != null) {
+                return response;
+            }
+            try {
+                SamlProtocolUtils.rejectRepeatedRedirectParameters(session.getContext().getUri().getQueryParameters(false));
+            } catch (VerificationException e) {
+                logger.debug("Invalid SAML redirect parameters", e);
+                event.event(EventType.IDENTITY_PROVIDER_RESPONSE);
+                event.error(Errors.INVALID_REQUEST);
+                return ErrorPage.error(session, null, Response.Status.BAD_REQUEST, Messages.INVALID_REQUEST);
+            }
+            return null;
+        }
+
+        @Override
         protected boolean containsUnencryptedSignature(SAMLDocumentHolder documentHolder) {
             MultivaluedMap<String, String> encodedParams = session.getContext().getUri().getQueryParameters(false);
             String algorithm = encodedParams.getFirst(GeneralConstants.SAML_SIG_ALG_REQUEST_KEY);
@@ -898,9 +930,9 @@ public class SAMLEndpoint {
         }
 
         @Override
-        protected void verifySignature(String key, SAMLDocumentHolder documentHolder) throws VerificationException {
+        protected void verifySignature(String key, SAMLDocumentHolder documentHolder, String message, String relayState) throws VerificationException {
             KeyLocator locator = getIDPKeyLocator();
-            SamlProtocolUtils.verifyRedirectSignature(documentHolder, locator, session.getContext().getUri(), key);
+            SamlProtocolUtils.verifyRedirectSignature(documentHolder, locator, session.getContext().getUri(), key, message, relayState);
         }
 
         @Override
@@ -945,7 +977,7 @@ public class SAMLEndpoint {
         }
 
         @Override
-        protected void verifySignature(String key, SAMLDocumentHolder documentHolder) throws VerificationException {
+        protected void verifySignature(String key, SAMLDocumentHolder documentHolder, String message, String relayState) throws VerificationException {
             if (verified != null) {
                 // this is the second pass and signatures were already verified in the artifact response time
                 return;
@@ -1079,28 +1111,30 @@ public class SAMLEndpoint {
 
         AssertionType assertion = responseType.getAssertions().get(0).getAssertion();
         SubjectType subjectElement = assertion.getSubject();
-        if (subjectElement != null) {
-            if (subjectElement.getConfirmation() != null && !subjectElement.getConfirmation().isEmpty()) {
-                SubjectConfirmationType subjectConfirmationElement = subjectElement.getConfirmation().stream()
+
+        List<SubjectConfirmationType> bearerConfirmations = subjectElement == null || subjectElement.getConfirmation() == null
+                ? List.of()
+                : subjectElement.getConfirmation().stream()
                         .filter(c -> JBossSAMLURIConstants.SUBJECT_CONFIRMATION_BEARER.get().equals(c.getMethod()))
-                        .findFirst().orElse(null);
+                        .collect(Collectors.toList());
 
-                if (subjectConfirmationElement != null) {
-                    SubjectConfirmationDataType subjectConfirmationDataElement = subjectConfirmationElement.getSubjectConfirmationData();
-                    SubjectConfirmationDataValidator.Builder scdvb = new SubjectConfirmationDataValidator.Builder(assertion.getID(), subjectConfirmationDataElement, destinationValidator)
-                            .inResponseTo(expectedRequestId)
-                            .clockSkewInMillis(1000 * config.getAllowedClockSkew());
-                    if (responseType.getDestination() != null) {
-                        scdvb.allowedRecipient(responseType.getDestination());
-                    }
+        for (SubjectConfirmationType subjectConfirmationElement : bearerConfirmations) {
+            SubjectConfirmationDataType subjectConfirmationDataElement = subjectConfirmationElement.getSubjectConfirmationData();
+            if (subjectConfirmationDataElement == null) {
+                continue;
+            }
+            SubjectConfirmationDataValidator.Builder scdvb = new SubjectConfirmationDataValidator.Builder(assertion.getID(), subjectConfirmationDataElement, destinationValidator)
+                    .inResponseTo(expectedRequestId)
+                    .clockSkewInMillis(1000 * config.getAllowedClockSkew());
+            if (responseType.getDestination() != null) {
+                scdvb.allowedRecipient(responseType.getDestination());
+            }
 
-                    if (!scdvb.build().isValid()) {
-                        return false;
-                    }
-                }
+            if (scdvb.build().isValid()) {
+                return true;
             }
         }
 
-        return true;
+        return false;
     }
 }
