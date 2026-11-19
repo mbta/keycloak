@@ -46,6 +46,7 @@ import org.keycloak.connections.httpclient.HttpClientProvider;
 import org.keycloak.events.admin.OperationType;
 import org.keycloak.events.admin.ResourceType;
 import org.keycloak.http.FormPartValue;
+import org.keycloak.models.AdminRoles;
 import org.keycloak.models.IdentityProviderCapability;
 import org.keycloak.models.IdentityProviderModel;
 import org.keycloak.models.IdentityProviderQuery;
@@ -75,6 +76,7 @@ import org.eclipse.microprofile.openapi.annotations.parameters.Parameter;
 import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
 import org.eclipse.microprofile.openapi.annotations.responses.APIResponses;
 import org.eclipse.microprofile.openapi.annotations.tags.Tag;
+import org.jboss.logging.Logger;
 import org.jboss.resteasy.reactive.NoCache;
 
 import static jakarta.ws.rs.core.Response.Status.BAD_REQUEST;
@@ -85,6 +87,8 @@ import static jakarta.ws.rs.core.Response.Status.BAD_REQUEST;
  */
 @Extension(name = KeycloakOpenAPI.Profiles.ADMIN, value = "")
 public class IdentityProvidersResource {
+
+    protected static final Logger logger = Logger.getLogger(IdentityProvidersResource.class);
 
     private final RealmModel realm;
     private final KeycloakSession session;
@@ -229,7 +233,11 @@ public class IdentityProvidersResource {
 
         Function<IdentityProviderModel, IdentityProviderRepresentation> toRepresentation = Optional.ofNullable(briefRepresentation).orElse(false)
                 ? m -> ModelToRepresentation.toBriefRepresentation(realm, m)
-                : m -> StripSecretsUtils.stripSecrets(session, ModelToRepresentation.toRepresentation(session, realm, m));
+                : m -> {
+                    IdentityProviderRepresentation rep = StripSecretsUtils.stripSecrets(session, ModelToRepresentation.toRepresentation(session, realm, m));
+                    Organizations.filterOrganizationLinks(rep, session, auth);
+                    return rep;
+                };
 
         boolean searchRealmOnlyIDPs = Optional.ofNullable(realmOnly).orElse(false);
 
@@ -278,6 +286,11 @@ public class IdentityProvidersResource {
 
         try {
             IdentityProviderModel identityProvider = RepresentationToModel.toModel(realm, representation, session);
+            if (!auth.hasOneAdminRole(AdminRoles.MANAGE_REALM) && identityProvider.isAllowAdminRoleMapping()) {
+                throw ErrorResponse.error("Only users with '" + AdminRoles.MANAGE_REALM
+                        + "' role can enable the '" + IdentityProviderModel.ALLOW_ADMIN_ROLE_MAPPING + "' setting.",
+                        Response.Status.FORBIDDEN);
+            }
             session.identityProviders().create(identityProvider);
 
             representation.setInternalId(identityProvider.getInternalId());
@@ -291,6 +304,10 @@ public class IdentityProvidersResource {
 
             if (message == null) {
                 message = "Invalid request";
+            }
+
+            if (logger.isDebugEnabled()) {
+                logger.debug(message, e);
             }
 
             throw ErrorResponse.error(message, BAD_REQUEST);
@@ -319,4 +336,5 @@ public class IdentityProvidersResource {
         return Stream.concat(session.getKeycloakSessionFactory().getProviderFactoriesStream(IdentityProvider.class),
                 session.getKeycloakSessionFactory().getProviderFactoriesStream(SocialIdentityProvider.class));
     }
+
 }

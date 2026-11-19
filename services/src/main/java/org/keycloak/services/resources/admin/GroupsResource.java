@@ -198,6 +198,10 @@ public class GroupsResource {
     public Response addTopLevelGroup(GroupRepresentation rep) {
         auth.groups().requireManage();
 
+        if (rep == null) {
+            throw ErrorResponse.error("Group representation is missing", Response.Status.BAD_REQUEST);
+        }
+
         GroupModel child;
         Response.ResponseBuilder builder = Response.status(204);
         String groupName = rep.getName();
@@ -216,6 +220,7 @@ public class GroupsResource {
                     throw ErrorResponse.error("Cannot manage organization related group via non Organization API.", Status.BAD_REQUEST);
                 }
                 if (child.getParentId() != null) {
+                    auth.groups().requireManage(child);
                     realm.moveGroup(child, null);
                 }
                 adminEvent.operation(OperationType.UPDATE).resourcePath(session.getContext().getUri());

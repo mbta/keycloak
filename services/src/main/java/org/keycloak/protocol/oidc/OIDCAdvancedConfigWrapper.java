@@ -39,7 +39,7 @@ import static org.keycloak.protocol.oidc.OIDCConfigAttributes.USE_RFC9068_ACCESS
  */
 public class OIDCAdvancedConfigWrapper extends AbstractClientConfigWrapper {
 
-    public static enum TokenExchangeRefreshTokenEnabled {NO, SAME_SESSION};
+    public enum TokenExchangeRefreshTokenEnabled {NO, SAME_SESSION};
 
     private OIDCAdvancedConfigWrapper(ClientModel client, ClientRepresentation clientRep) {
         super(client,clientRep);
@@ -265,6 +265,15 @@ public class OIDCAdvancedConfigWrapper extends AbstractClientConfigWrapper {
     public void setStandardTokenExchangeRefreshEnabled(TokenExchangeRefreshTokenEnabled enable) {
         setAttribute(OIDCConfigAttributes.STANDARD_TOKEN_EXCHANGE_REFRESH_ENABLED,
                 enable == null || enable == TokenExchangeRefreshTokenEnabled.NO? null : enable.name());
+    }
+
+    public boolean isStandardTokenExchangeAllowExpirationAfterSubject() {
+        String val = getAttribute(OIDCConfigAttributes.STANDARD_TOKEN_EXCHANGE_ALLOW_EXPIRATION_AFTER_SUBJECT, "false");
+        return Boolean.parseBoolean(val);
+    }
+
+    public void setStandardTokenExchangeAllowExpirationAfterSubject(boolean enable) {
+        setAttribute(OIDCConfigAttributes.STANDARD_TOKEN_EXCHANGE_ALLOW_EXPIRATION_AFTER_SUBJECT, String.valueOf(enable));
     }
 
     public boolean getJWTAuthorizationGrantEnabled() {
@@ -545,5 +554,14 @@ public class OIDCAdvancedConfigWrapper extends AbstractClientConfigWrapper {
 
     public void setAllowUserinfoWithLightweightAccessToken(boolean allow) {
         setAttribute(OIDCConfigAttributes.ALLOW_USERINFO_WITH_LIGHTWEIGHT_ACCESS_TOKEN, String.valueOf(allow));
+    }
+
+    public boolean isAllowOidcParamsInRedirectUris() {
+        String val = getAttribute(OIDCConfigAttributes.ALLOW_OIDC_PARAMS_IN_REDIRECT_URIS, "false");
+        return Boolean.parseBoolean(val);
+    }
+
+    public void setAllowOidcParamsInRedirectUris(boolean allow) {
+        setAttribute(OIDCConfigAttributes.ALLOW_OIDC_PARAMS_IN_REDIRECT_URIS, String.valueOf(allow));
     }
 }

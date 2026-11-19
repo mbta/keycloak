@@ -69,6 +69,8 @@ public class KeycloakIdentity implements Identity {
     private final boolean resourceServer;
     private final String id;
     private UserModel user;
+    private ClientModel requestingClient;
+    private boolean transientRolesResolved;
 
     public KeycloakIdentity(KeycloakSession keycloakSession) {
         this(Tokens.getAccessToken(keycloakSession), keycloakSession);
@@ -173,6 +175,9 @@ public class KeycloakIdentity implements Identity {
         }
 
         UserModel user = getUserFromToken();
+        if (user == null) {
+            throw new IllegalArgumentException("User from token not found");
+        }
 
         addRolesAsAttributes(this.accessToken, realm, user, attributes);
 
@@ -300,7 +305,40 @@ public class KeycloakIdentity implements Identity {
             return false;
         }
 
-        return user.hasRole(role);
+        boolean hasRole = user.hasRole(role);
+
+        if (!hasRole) {
+            return false;
+        }
+
+        ClientModel requestingClient = getRequestingClient();
+
+        if (requestingClient != null && !requestingClient.hasScope(role)) {
+            resolveTransientClientScopeRoles();
+
+            Map<String, Access> resourceAccess = accessToken.getResourceAccess();
+
+            if (resourceAccess == null) {
+                return false;
+            }
+
+            Access access = resourceAccess.get(clientId);
+
+            if (access == null) {
+                return false;
+            }
+
+            hasRole = access.isUserInRole(roleName);
+        }
+
+        return hasRole;
+    }
+
+    private void resolveTransientClientScopeRoles() {
+        if (!transientRolesResolved) {
+            AuthenticationManager.resolveLightweightAccessTokenRoles(keycloakSession, accessToken, realm);
+            transientRolesResolved = true;
+        }
     }
 
     @Override
@@ -315,7 +353,27 @@ public class KeycloakIdentity implements Identity {
             return false;
         }
 
-        return user.hasRole(role);
+        boolean hasRole = user.hasRole(role);
+
+        if (!hasRole) {
+            return false;
+        }
+
+        ClientModel requestingClient = getRequestingClient();
+
+        if (requestingClient != null && !requestingClient.hasScope(role)) {
+            resolveTransientClientScopeRoles();
+
+            Access realmAccess = accessToken.getRealmAccess();
+
+            if (realmAccess == null) {
+                return false;
+            }
+
+            hasRole = realmAccess.isUserInRole(roleName);
+        }
+
+        return hasRole;
     }
 
     public AccessToken getAccessToken() {
@@ -337,6 +395,15 @@ public class KeycloakIdentity implements Identity {
         }
 
         return null;
+    }
+
+    private ClientModel getRequestingClient() {
+        if (requestingClient == null) {
+            if (this.accessToken.getIssuedFor() != null) {
+                requestingClient = realm.getClientByClientId(accessToken.getIssuedFor());
+            }
+        }
+        return requestingClient;
     }
 
     private UserModel getUserFromToken() {

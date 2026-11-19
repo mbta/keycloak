@@ -403,6 +403,11 @@ public class RealmBuilder extends Builder<RealmRepresentation> {
         return this;
     }
 
+    public RealmBuilder otpCodeReusable(Boolean reusable) {
+        rep.setOtpPolicyCodeReusable(reusable);
+        return this;
+    }
+
     public RealmBuilder passwordPolicy(String passwordPolicy) {
         rep.setPasswordPolicy(passwordPolicy);
         return this;
@@ -608,6 +613,16 @@ public class RealmBuilder extends Builder<RealmRepresentation> {
         return this;
     }
 
+    public RealmBuilder webAuthnPolicyPasswordlessAcceptableAaguids(List<String> aaguids) {
+        rep.setWebAuthnPolicyPasswordlessAcceptableAaguids(aaguids);
+        return this;
+    }
+
+    public RealmBuilder webAuthnPolicyPasswordlessRpId(String rpId) {
+        rep.setWebAuthnPolicyPasswordlessRpId(rpId);
+        return this;
+    }
+
     public RealmBuilder scimEnabled(boolean enabled) {
         rep.setScimApiEnabled(enabled);
         return this;
@@ -659,6 +674,11 @@ public class RealmBuilder extends Builder<RealmRepresentation> {
 
     public RealmBuilder accountTheme(String accountTheme) {
         rep.setAccountTheme(accountTheme);
+        return this;
+    }
+
+    public RealmBuilder loginTheme(String loginTheme) {
+        rep.setLoginTheme(loginTheme);
         return this;
     }
 

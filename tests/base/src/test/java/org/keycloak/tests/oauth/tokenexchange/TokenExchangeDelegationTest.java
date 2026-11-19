@@ -1,7 +1,6 @@
 package org.keycloak.tests.oauth.tokenexchange;
 
 import java.io.IOException;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -15,6 +14,7 @@ import org.keycloak.admin.client.resource.ClientResource;
 import org.keycloak.admin.client.resource.ClientScopeResource;
 import org.keycloak.authorization.fgap.AdminPermissionsSchema;
 import org.keycloak.common.Profile;
+import org.keycloak.common.constants.ServiceAccountConstants;
 import org.keycloak.events.Details;
 import org.keycloak.events.Errors;
 import org.keycloak.events.EventType;
@@ -24,7 +24,6 @@ import org.keycloak.models.Constants;
 import org.keycloak.models.ProtocolMapperModel;
 import org.keycloak.models.utils.ModelToRepresentation;
 import org.keycloak.protocol.oidc.OIDCConfigAttributes;
-import org.keycloak.protocol.oidc.OIDCLoginProtocol;
 import org.keycloak.protocol.oidc.OIDCLoginProtocolFactory;
 import org.keycloak.protocol.oidc.grants.ciba.CibaGrantTypeFactory;
 import org.keycloak.protocol.oidc.grants.ciba.channel.AuthenticationChannelResponse;
@@ -38,10 +37,15 @@ import org.keycloak.representations.idm.ClientScopeRepresentation;
 import org.keycloak.representations.idm.EventRepresentation;
 import org.keycloak.representations.idm.GroupRepresentation;
 import org.keycloak.representations.idm.ProtocolMapperRepresentation;
+import org.keycloak.representations.idm.RoleRepresentation;
+import org.keycloak.representations.idm.authorization.ClientPolicyRepresentation;
 import org.keycloak.representations.idm.authorization.Logic;
 import org.keycloak.representations.idm.authorization.ScopePermissionRepresentation;
 import org.keycloak.representations.idm.authorization.UserPolicyRepresentation;
 import org.keycloak.representations.oidc.TokenMetadataRepresentation;
+import org.keycloak.services.clientpolicy.condition.AnyClientConditionFactory;
+import org.keycloak.services.clientpolicy.executor.RejectMayActClaimExecutor;
+import org.keycloak.services.clientpolicy.executor.RejectMayActClaimExecutorFactory;
 import org.keycloak.testframework.annotations.InjectClient;
 import org.keycloak.testframework.annotations.InjectEvents;
 import org.keycloak.testframework.annotations.InjectRealm;
@@ -56,6 +60,8 @@ import org.keycloak.testframework.oauth.annotations.InjectCibaProvider;
 import org.keycloak.testframework.oauth.annotations.InjectOAuthClient;
 import org.keycloak.testframework.realm.ClientBuilder;
 import org.keycloak.testframework.realm.ClientConfig;
+import org.keycloak.testframework.realm.ClientPolicyBuilder;
+import org.keycloak.testframework.realm.ClientProfileBuilder;
 import org.keycloak.testframework.realm.ManagedClient;
 import org.keycloak.testframework.realm.ManagedRealm;
 import org.keycloak.testframework.realm.ManagedUser;
@@ -86,7 +92,11 @@ import org.junit.jupiter.api.Test;
 import static org.keycloak.representations.IDToken.ACT;
 import static org.keycloak.representations.IDToken.MAY_ACT;
 import static org.keycloak.representations.IDToken.PREFERRED_USERNAME;
-import static org.keycloak.representations.JsonWebToken.SUBJECT;
+import static org.keycloak.tests.oauth.tokenexchange.DelegationAssertions.assertActPresent;
+import static org.keycloak.tests.oauth.tokenexchange.DelegationAssertions.assertMayActNotPresent;
+import static org.keycloak.tests.oauth.tokenexchange.DelegationAssertions.assertMayActPresent;
+import static org.keycloak.tests.oauth.tokenexchange.DelegationAssertions.assertScopeContains;
+import static org.keycloak.tests.oauth.tokenexchange.DelegationAssertions.assertScopeNotContains;
 
 /**
  *
@@ -107,8 +117,11 @@ public class TokenExchangeDelegationTest {
     @InjectUser(config = AdministratorUserConfig.class)
     ManagedUser administrator;
 
-    @InjectClient(config = AdminClientConfig.class)
+    @InjectClient(config = AdminClientConfig.class, ref = "adminApp")
     ManagedClient adminApp;
+
+    @InjectClient(config = ServiceAccountClientConfig.class, ref = "serviceAccountApp")
+    ManagedClient serviceAccountApp;
 
     @InjectEvents
     protected Events events;
@@ -134,7 +147,7 @@ public class TokenExchangeDelegationTest {
         // disable FGAP V2 - delegation requires it, so the scope should be silently dropped
         realm.updateWithCleanup(r -> r.adminPermissionsEnabled(false));
 
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope, grants -> MatcherAssert.assertThat(grants,
                 Matchers.not(Matchers.hasItem(Matchers.containsString("Delegate token")))));
         Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
@@ -149,7 +162,7 @@ public class TokenExchangeDelegationTest {
     @Test
     public void delegationNoDelegatePermission() {
         // request delegation with a user that has no delegate permission
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope, grants -> MatcherAssert.assertThat(grants,
                 Matchers.not(Matchers.hasItem(Matchers.containsString("Delegate token")))));
         Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
@@ -162,11 +175,44 @@ public class TokenExchangeDelegationTest {
     }
 
     @Test
+    public void userDelegationRejectsServiceAccountUsername() {
+        ClientResource adminPerms = AdminApiUtil.findClientByClientId(realm.admin(), Constants.ADMIN_PERMISSIONS_CLIENT_ID);
+        ClientPolicyRepresentation clientPolicy = PermissionTestUtils.createClientPolicy(realm, adminPerms,
+                "SA Client Policy", serviceAccountApp.getClientId());
+        PermissionTestUtils.createAllPermission(adminPerms, AdminPermissionsSchema.USERS_RESOURCE_TYPE,
+                clientPolicy, Set.of(AdminPermissionsSchema.DELEGATE));
+
+        String serviceAccountUsername = ServiceAccountConstants.SERVICE_ACCOUNT_USER_PREFIX + serviceAccountApp.getClientId();
+
+        // user-delegation with a service-account username is rejected even with delegation permission
+        final String userScope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + serviceAccountUsername;
+        AccessTokenResponse res = loginWithDelegation(userScope, grants -> MatcherAssert.assertThat(grants,
+                Matchers.not(Matchers.hasItem(Matchers.containsString("Delegate token")))));
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertScopeNotContains(res.getScope(), userScope);
+        assertMayActNotPresent(oauth.verifyToken(res.getAccessToken()));
+
+        LogoutResponse logout = oauth.doLogout(res.getRefreshToken());
+        Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
+        EventAssertion.assertSuccess(events.poll()).type(EventType.LOGOUT);
+
+        // client-delegation with the same client works
+        final String clientScope = OIDCLoginProtocolFactory.CLIENT_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + serviceAccountApp.getClientId();
+        res = loginWithDelegation(clientScope, grants -> MatcherAssert.assertThat(grants,
+                Matchers.hasItem("Allow " + serviceAccountApp.getClientId() + " to act on your behalf?")));
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertScopeContains(res.getScope(), clientScope);
+
+        logout = oauth.doLogout(res.getRefreshToken());
+        Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
+    }
+
+    @Test
     public void delegation() {
         ScopePermissionRepresentation permission = addDelegationPermission();
 
         // request the delegation to administrator and accept the delegation
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope);
 
         Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
@@ -211,7 +257,7 @@ public class TokenExchangeDelegationTest {
                 AdminPermissionsSchema.USERS_RESOURCE_TYPE, Set.of(AdminPermissionsSchema.DELEGATE), policy);
 
         // request the delegation to administrator and accept the delegation
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope);
 
         Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
@@ -263,7 +309,7 @@ public class TokenExchangeDelegationTest {
                 AdminPermissionsSchema.GROUPS_RESOURCE_TYPE, Set.of(AdminPermissionsSchema.DELEGATE_MEMBERS), policy);
 
         // request the delegation to administrator and accept the delegation
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope);
 
         Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
@@ -295,7 +341,7 @@ public class TokenExchangeDelegationTest {
                 AdminPermissionsSchema.USERS_RESOURCE_TYPE, Set.of(AdminPermissionsSchema.IMPERSONATE), policy);
 
         // delegation scope should be silently dropped since only impersonate is granted, not delegate
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope, grants -> MatcherAssert.assertThat(grants,
                 Matchers.not(Matchers.hasItem(Matchers.containsString("Delegate token")))));
         Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
@@ -323,7 +369,7 @@ public class TokenExchangeDelegationTest {
                 AdminPermissionsSchema.USERS_RESOURCE_TYPE, Set.of(AdminPermissionsSchema.DELEGATE), denyPolicy);
 
         // delegation scope should be silently dropped due to negative policy on the specific user
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope, grants -> MatcherAssert.assertThat(grants,
                 Matchers.not(Matchers.hasItem(Matchers.containsString("Delegate token")))));
         Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
@@ -349,7 +395,7 @@ public class TokenExchangeDelegationTest {
         });
 
         // request the delegation to administrator and accept the delegation using implicit
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         oauth.scope(scope).responseType(OAuth2Constants.TOKEN).openLoginForm();
         oauth.fillLoginForm(USERNAME, PASSWORD);
         grantPage.assertCurrent();
@@ -387,6 +433,32 @@ public class TokenExchangeDelegationTest {
     }
 
     @Test
+    public void introspectionMapperCannotOverwriteDelegationActor() {
+        addDelegationPermission();
+
+        ProtocolMapperModel actorMapper = HardcodedClaim.create(
+                "introspection-act-sub-mapper", "act.sub", "mapper-actor", "String", false, false, true);
+
+        String clientId = oauth.getClientId();
+        String mapperId;
+        try (Response response = oauth.clientResource().getProtocolMappers()
+                .createMapper(ModelToRepresentation.toRepresentation(actorMapper))) {
+            Assertions.assertEquals(201, response.getStatus(), "Mapper creation should succeed");
+            mapperId = ApiUtil.getCreatedId(response);
+        }
+        realm.cleanup().add(r -> AdminApiUtil.findClientByClientId(r, clientId).getProtocolMappers().delete(mapperId));
+
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        AccessTokenResponse res = loginWithDelegation(scope);
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+
+        tokenExchangeDelegationSuccess(res.getAccessToken(), getActorToken());
+
+        LogoutResponse logout = oauth.doLogout(res.getRefreshToken());
+        Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
+    }
+
+    @Test
     public void delegationWithPreferredUsernameMapper() {
         addDelegationPermission();
 
@@ -408,7 +480,7 @@ public class TokenExchangeDelegationTest {
                     .ifPresent(m -> r.clientScopes().get(delegationScopeId).getProtocolMappers().delete(m.getId()));
         });
 
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope);
 
         Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
@@ -433,10 +505,217 @@ public class TokenExchangeDelegationTest {
     }
 
     @Test
+    public void delegationDroppedWhenTargetUserRecreated() {
+        String tempUsername = "temp-delegate";
+
+        String tempUserId = createUser(tempUsername);
+        ScopePermissionRepresentation oldPermission = addDelegationPermission(tempUserId, "Temp Delegate Policy");
+
+        // login with delegation to temp user and accept consent
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + tempUsername;
+        AccessTokenResponse res = loginWithDelegation(scope, grants ->
+                MatcherAssert.assertThat(grants, Matchers.hasItem(Matchers.containsString("Delegate token"))));
+
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertScopeContains(res.getScope(), scope);
+        assertMayActPresent(oauth.verifyToken(res.getAccessToken()), tempUserId);
+
+        // refresh with the original user still in place - should succeed
+        res = oauth.scope(null).doRefreshTokenRequest(res.getRefreshToken());
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertScopeContains(res.getScope(), scope);
+        assertMayActPresent(oauth.verifyToken(res.getAccessToken()), tempUserId);
+
+        // remove stale permission, delete the temp user and recreate with the same username (new UUID)
+        ClientResource adminPerms = AdminApiUtil.findClientByClientId(realm.admin(), Constants.ADMIN_PERMISSIONS_CLIENT_ID);
+        adminPerms.authorization().permissions().scope().findById(oldPermission.getId()).remove();
+        realm.admin().users().get(tempUserId).remove();
+        String newUserId = recreateUserWithDelegation(tempUsername);
+
+        // refresh - FGAP passes but identity pinning detects the mismatch, scope dropped
+        res = oauth.scope(null).doRefreshTokenRequest(res.getRefreshToken());
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertScopeNotContains(res.getScope(), scope);
+        assertMayActNotPresent(oauth.verifyToken(res.getAccessToken()));
+
+        // revoke consent and re-authorize within the same SSO session;
+        // fresh auth clears the stale pin, so re-consent works with the new identity
+        AccountHelper.revokeConsents(realm.admin(), USERNAME, oauth.getClientId());
+        res = loginWithDelegation(scope, grants ->
+                MatcherAssert.assertThat(grants, Matchers.hasItem(Matchers.containsString("Delegate token"))), false);
+
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertScopeContains(res.getScope(), scope);
+        assertMayActPresent(oauth.verifyToken(res.getAccessToken()), newUserId);
+
+        // refresh with the re-pinned identity should succeed
+        res = oauth.scope(null).doRefreshTokenRequest(res.getRefreshToken());
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertScopeContains(res.getScope(), scope);
+        assertMayActPresent(oauth.verifyToken(res.getAccessToken()), newUserId);
+
+        LogoutResponse logout = oauth.doLogout(res.getRefreshToken());
+        Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
+    }
+
+    @Test
+    public void delegationDroppedWhenTargetUserRecreatedBeforeCodeExchange() {
+        String tempUsername = "temp-delegate-code";
+
+        String tempUserId = createUser(tempUsername);
+        ScopePermissionRepresentation oldPermission = addDelegationPermission(tempUserId, "Temp Delegate Policy Code");
+
+        // authorize with delegation to the temp user, but hold on to the code without redeeming it yet
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + tempUsername;
+        oauth.scope(scope).openLoginForm();
+        oauth.fillLoginForm(USERNAME, PASSWORD);
+        grantPage.assertCurrent();
+        MatcherAssert.assertThat(grantPage.getDisplayedGrants(), Matchers.hasItem(Matchers.containsString("Delegate token")));
+        grantPage.accept();
+        events.poll();
+        String code = oauth.parseLoginResponse().getCode();
+
+        // attacker window: target user is deleted and recreated with the same username before the code is redeemed
+        ClientResource adminPerms = AdminApiUtil.findClientByClientId(realm.admin(), Constants.ADMIN_PERMISSIONS_CLIENT_ID);
+        adminPerms.authorization().permissions().scope().findById(oldPermission.getId()).remove();
+        realm.admin().users().get(tempUserId).remove();
+        recreateUserWithDelegation(tempUsername);
+
+        // redeem the code - identity pinning must reject the scope for the recreated identity even on first issuance
+        AccessTokenResponse res = oauth.doAccessTokenRequest(code);
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertScopeNotContains(res.getScope(), scope);
+        assertMayActNotPresent(oauth.verifyToken(res.getAccessToken()));
+
+        LogoutResponse logout = oauth.doLogout(res.getRefreshToken());
+        Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
+    }
+
+    @Test
+    public void delegationDroppedOnCrossClientIntrospectionAfterTargetUserRecreated() {
+        String tempUsername = "temp-delegate-introspect";
+        String tempUserId = createUser(tempUsername);
+        ScopePermissionRepresentation oldPermission = addDelegationPermission(tempUserId, "Temp Delegate Policy Introspect");
+
+        // login with delegation to the temp user and accept consent
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + tempUsername;
+        AccessTokenResponse res = loginWithDelegation(scope, grants ->
+                MatcherAssert.assertThat(grants, Matchers.hasItem(Matchers.containsString("Delegate token"))));
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertScopeContains(res.getScope(), scope);
+        assertMayActPresent(oauth.verifyToken(res.getAccessToken()), tempUserId);
+
+        // remove stale permission, delete the temp user and recreate with the same username (new UUID)
+        ClientResource adminPerms = AdminApiUtil.findClientByClientId(realm.admin(), Constants.ADMIN_PERMISSIONS_CLIENT_ID);
+        adminPerms.authorization().permissions().scope().findById(oldPermission.getId()).remove();
+        realm.admin().users().get(tempUserId).remove();
+        recreateUserWithDelegation(tempUsername);
+
+        // a different client (not the one the token was issued to) introspects the already-issued access token;
+        // identity pinning must be enforced using the token's own client session, not the introspecting client
+        createIntrospectingClient("cross-client-introspector", "cross-client-secret");
+        IntrospectionResponse introspectRes;
+        try {
+            introspectRes = oauth.client("cross-client-introspector", "cross-client-secret")
+                    .doIntrospectionAccessTokenRequest(res.getAccessToken());
+        } finally {
+            oauth.client("test-app", "test-secret");
+        }
+        Assertions.assertTrue(introspectRes.isSuccess());
+        try {
+            // introspection's "scope" field is copied verbatim from the original token and isn't re-validated;
+            // may_act is added by a mapper driven by the freshly re-resolved scopes, so it reflects the pin check
+            TokenMetadataRepresentation rep = introspectRes.asTokenMetadata();
+            Assertions.assertTrue(rep.isActive(), "Token must still be reported as active");
+            assertMayActNotPresent(rep);
+        } catch (IOException e) {
+            Assertions.fail(e);
+        }
+
+        LogoutResponse logout = oauth.doLogout(res.getRefreshToken());
+        Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
+    }
+
+    @Test
+    public void delegationOfflineSessionPinSyncedOnReauthorization() {
+        // offline tokens need both the client scope and the user role, granted at runtime to not replace the defaults
+        String offlineScopeId = AdminApiUtil.findClientScopeByName(realm.admin(), OAuth2Constants.OFFLINE_ACCESS).toRepresentation().getId();
+        AdminApiUtil.findClientByClientId(realm.admin(), oauth.getClientId()).addOptionalClientScope(offlineScopeId);
+        realm.cleanup().add(r -> AdminApiUtil.findClientByClientId(r, oauth.getClientId()).removeOptionalClientScope(offlineScopeId));
+
+        RoleRepresentation offlineRole = AdminApiUtil.findRealmRoleByName(realm.admin(), Constants.OFFLINE_ACCESS_ROLE).toRepresentation();
+        AdminApiUtil.findUserByUsernameId(realm.admin(), USERNAME).roles().realmLevel().add(List.of(offlineRole));
+        realm.cleanup().add(r -> AdminApiUtil.findUserByUsernameId(r, USERNAME).roles().realmLevel().remove(List.of(offlineRole)));
+
+        String tempUsername = "temp-delegate-offline";
+        String tempUserId = createUser(tempUsername);
+        ScopePermissionRepresentation oldPermission = addDelegationPermission(tempUserId, "Temp Delegate Policy Offline");
+
+        final String delegationScope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + tempUsername;
+        final String scope = delegationScope + " " + OAuth2Constants.OFFLINE_ACCESS;
+
+        // plain login first - an SSO session created by the offline request itself is removed again right away
+        loginWithDelegation(delegationScope, grants ->
+                MatcherAssert.assertThat(grants, Matchers.hasItem(Matchers.containsString("Delegate token"))));
+
+        // offline_access in the existing SSO session creates the offline client session
+        AccessTokenResponse res = loginWithDelegation(scope, grants ->
+                MatcherAssert.assertThat(grants, Matchers.hasItem(Matchers.containsString("Delegate token"))), false);
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertScopeContains(res.getScope(), delegationScope);
+        assertMayActPresent(oauth.verifyToken(res.getAccessToken()), tempUserId);
+
+        // remove stale permission, delete the temp user and recreate with the same username (new UUID)
+        ClientResource adminPerms = AdminApiUtil.findClientByClientId(realm.admin(), Constants.ADMIN_PERMISSIONS_CLIENT_ID);
+        adminPerms.authorization().permissions().scope().findById(oldPermission.getId()).remove();
+        realm.admin().users().get(tempUserId).remove();
+        String newUserId = recreateUserWithDelegation(tempUsername);
+
+        // stale pin on the offline session - delegation is dropped, not followed to the recreated user
+        AccessTokenResponse staleRefresh = oauth.scope(null).doRefreshTokenRequest(res.getRefreshToken());
+        Assertions.assertTrue(staleRefresh.isSuccess(), staleRefresh.getError() + " - " + staleRefresh.getErrorDescription());
+        assertScopeNotContains(staleRefresh.getScope(), delegationScope);
+        assertMayActNotPresent(oauth.verifyToken(staleRefresh.getAccessToken()));
+
+        // refreshing again must not clear the pin
+        staleRefresh = oauth.scope(null).doRefreshTokenRequest(staleRefresh.getRefreshToken());
+        Assertions.assertTrue(staleRefresh.isSuccess(), staleRefresh.getError() + " - " + staleRefresh.getErrorDescription());
+        assertScopeNotContains(staleRefresh.getScope(), delegationScope);
+        assertMayActNotPresent(oauth.verifyToken(staleRefresh.getAccessToken()));
+
+        // an authorization without the delegation scope has no pin to sync and must not clear the existing one
+        oauth.scope(OAuth2Constants.OFFLINE_ACCESS).openLoginForm();
+        events.poll();
+        oauth.doAccessTokenRequest(oauth.parseLoginResponse().getCode());
+        events.poll();
+
+        staleRefresh = oauth.scope(null).doRefreshTokenRequest(staleRefresh.getRefreshToken());
+        Assertions.assertTrue(staleRefresh.isSuccess(), staleRefresh.getError() + " - " + staleRefresh.getErrorDescription());
+        assertScopeNotContains(staleRefresh.getScope(), delegationScope);
+        assertMayActNotPresent(oauth.verifyToken(staleRefresh.getAccessToken()));
+
+        // re-authorize in the same SSO session - fresh auth re-pins to the recreated identity
+        AccessTokenResponse res2 = loginWithDelegation(scope, grants ->
+                MatcherAssert.assertThat(grants, Matchers.hasItem(Matchers.containsString("Delegate token"))), false);
+        Assertions.assertTrue(res2.isSuccess(), res2.getError() + " - " + res2.getErrorDescription());
+        assertScopeContains(res2.getScope(), delegationScope);
+        assertMayActPresent(oauth.verifyToken(res2.getAccessToken()), newUserId);
+
+        // the reused offline client session must have picked up the new pin
+        AccessTokenResponse offlineRefresh = oauth.scope(null).doRefreshTokenRequest(staleRefresh.getRefreshToken());
+        Assertions.assertTrue(offlineRefresh.isSuccess(), offlineRefresh.getError() + " - " + offlineRefresh.getErrorDescription());
+        assertScopeContains(offlineRefresh.getScope(), delegationScope);
+        assertMayActPresent(oauth.verifyToken(offlineRefresh.getAccessToken()), newUserId);
+
+        LogoutResponse logout = oauth.doLogout(res2.getRefreshToken());
+        Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
+    }
+
+    @Test
     public void cibaDelegationNoDelegatePermission() throws Exception {
 
         // request delegation with a user that has no delegate permission
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         oauth.scope(scope);
         AuthenticationRequestAcknowledgement response = oauth.ciba().backchannelAuthenticationRequest(USERNAME)
                 .bindingMessage("asdfghjkl")
@@ -468,7 +747,7 @@ public class TokenExchangeDelegationTest {
         ScopePermissionRepresentation permission = addDelegationPermission();
 
         // client Backchannel Authentication Request
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         oauth.scope(scope);
         AuthenticationRequestAcknowledgement response = oauth.ciba().backchannelAuthenticationRequest(USERNAME)
                 .bindingMessage("asdfghjkl")
@@ -540,7 +819,7 @@ public class TokenExchangeDelegationTest {
     public void failIfDisabledActor() {
         addDelegationPermission();
 
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope);
 
         ProtocolMapperRepresentation audienceMapper = adminApp.admin().getProtocolMappers().getMappers().iterator().next();
@@ -562,7 +841,7 @@ public class TokenExchangeDelegationTest {
     public void failIfInvalidAudienceInActorToken() {
         addDelegationPermission();
 
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope);
 
         ProtocolMapperRepresentation audienceMapper = adminApp.admin().getProtocolMappers().getMappers().iterator().next();
@@ -583,7 +862,7 @@ public class TokenExchangeDelegationTest {
     public void failIfNoAccessTokenRequested() {
         addDelegationPermission();
 
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope);
 
         String actorToken = getActorToken();
@@ -602,7 +881,7 @@ public class TokenExchangeDelegationTest {
     public void failIfOtherAdminInMayAct() {
         addDelegationPermission();
 
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope);
 
         String actorToken = getActorToken("otheruser", PASSWORD);
@@ -632,13 +911,13 @@ public class TokenExchangeDelegationTest {
         config.put(OIDCAttributeMapperHelper.JSON_TYPE, "String");
         config.put(OIDCAttributeMapperHelper.INCLUDE_IN_ACCESS_TOKEN, Boolean.TRUE.toString());
         issMapper.setConfig(config);
-        ClientScopeResource delegationScope = AdminApiUtil.findClientScopeByName(realm.admin(), OIDCLoginProtocolFactory.DELEGATION_SCOPE);
+        ClientScopeResource delegationScope = AdminApiUtil.findClientScopeByName(realm.admin(), OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE);
         String issMapperId = ApiUtil.getCreatedId(delegationScope.getProtocolMappers().createMapper(issMapper));
         issMapper.setId(issMapperId);
-        realm.cleanup().add(r -> AdminApiUtil.findClientScopeByName(r, OIDCLoginProtocolFactory.DELEGATION_SCOPE)
+        realm.cleanup().add(r -> AdminApiUtil.findClientScopeByName(r, OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE)
                 .getProtocolMappers().delete(issMapperId));
 
-        final String scope = OIDCLoginProtocolFactory.DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
         AccessTokenResponse res = loginWithDelegation(scope);
         assertMayActPresent(oauth.verifyToken(res.getAccessToken()), administrator.getId(), realm.getBaseUrl(), null);
 
@@ -667,10 +946,176 @@ public class TokenExchangeDelegationTest {
         Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
     }
 
+    @Test
+    public void rejectMayActClientPolicySuccess() {
+        addDelegationPermission();
+
+        realm.updateWithCleanup(r -> r.clientProfile(ClientProfileBuilder.create().name("executor").executor(RejectMayActClaimExecutorFactory.PROVIDER_ID, null).build())
+                .clientPolicy(ClientPolicyBuilder.create().name("policy").condition(AnyClientConditionFactory.PROVIDER_ID, null).profile("executor").build()));
+
+        // normal request should be OK when using common client scopes
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        AccessTokenResponse res = loginWithDelegation(scope);
+        assertMayActPresent(oauth.verifyToken(res.getAccessToken()), administrator.getId(), null, null);
+        LogoutResponse logout = oauth.doLogout(res.getRefreshToken());
+        Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
+    }
+
+    @Test
+    public void rejectMayActClientPolicyConsentParameterForms() {
+        addDelegationPermission();
+
+        realm.updateWithCleanup(r -> r.clientProfile(ClientProfileBuilder.create().name("executor").executor(RejectMayActClaimExecutorFactory.PROVIDER_ID, null).build())
+                .clientPolicy(ClientPolicyBuilder.create().name("policy").condition(AnyClientConditionFactory.PROVIDER_ID, null).profile("executor").build()));
+
+        // username and email lookups are case insensitive, but the consent note keeps each parameter verbatim
+        for (String parameter : List.of(administrator.getEmail(), administrator.getEmail().toUpperCase(),
+                administrator.getUsername().toUpperCase())) {
+            final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + parameter;
+            AccessTokenResponse res = loginWithDelegation(scope, grants -> MatcherAssert.assertThat(grants,
+                    Matchers.hasItem("Delegate token to administrator " + parameter + "?")));
+            Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+            assertScopeContains(res.getScope(), scope);
+            assertMayActPresent(oauth.verifyToken(res.getAccessToken()), administrator.getId(), null, null);
+
+            LogoutResponse logout = oauth.doLogout(res.getRefreshToken());
+            Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
+            EventAssertion.assertSuccess(events.poll()).type(EventType.LOGOUT);
+        }
+    }
+
+    @Test
+    public void rejectMayActClientPolicyRejectAny() {
+        addDelegationPermission();
+
+        realm.updateWithCleanup(r -> r
+                .clientProfile(ClientProfileBuilder.create().name("executor")
+                        .executor(RejectMayActClaimExecutorFactory.PROVIDER_ID, new RejectMayActClaimExecutor.Configuration(true, false, false))
+                        .build())
+                .clientPolicy(ClientPolicyBuilder.create().name("policy").condition(AnyClientConditionFactory.PROVIDER_ID, null).profile("executor").build()));
+
+        // normal request should be rejected as may_act is not allowed by the policy
+        final String scope = OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE + ClientScopeModel.VALUE_SEPARATOR + administrator.getUsername();
+        AccessTokenResponse res = loginWithDelegationNoEvent(scope, grants -> MatcherAssert.assertThat(grants,
+                Matchers.hasItem("Delegate token to administrator administrator?")));
+        Assertions.assertEquals(Errors.INVALID_REQUEST, res.getError());
+        Assertions.assertEquals("The may_act claim is rejected for this client", res.getErrorDescription());
+        EventAssertion.assertError(events.poll())
+                .type(EventType.CODE_TO_TOKEN_ERROR)
+                .clientId("test-app")
+                .hasUserId()
+                .error(Errors.INVALID_REQUEST)
+                .details(Details.REASON, Details.CLIENT_POLICY_ERROR)
+                .details(Details.CLIENT_POLICY_ERROR_DETAIL, "The may_act claim is rejected for this client");
+
+        AccountHelper.logout(realm.admin(), USERNAME);
+    }
+
+    @Test
+    public void rejectMayActClientPolicyPermission() {
+        createHardcodedSubMapperForAdministrator();
+
+        // default config checks permission is not granted
+        realm.updateWithCleanup(r -> r.clientProfile(ClientProfileBuilder.create().name("executor").executor(RejectMayActClaimExecutorFactory.PROVIDER_ID, null).build())
+                .clientPolicy(ClientPolicyBuilder.create().name("policy").condition(AnyClientConditionFactory.PROVIDER_ID, null).profile("executor").build()));
+
+        AccessTokenResponse res = loginWithDelegationNoEvent(null, grants -> MatcherAssert.assertThat(grants,
+                Matchers.not(Matchers.hasItem(Matchers.containsString("Delegate token")))));
+        Assertions.assertEquals(Errors.INVALID_REQUEST, res.getError());
+        Assertions.assertEquals("Invalid may_act sub in the token", res.getErrorDescription());
+
+        AccountHelper.logout(realm.admin(), USERNAME);
+
+        // explicitly do not check permissions and consents
+        realm.updateWithCleanup(r -> r.resetClientProfiles().resetClientPolicies()
+                .clientProfile(ClientProfileBuilder.create().name("executor")
+                        .executor(RejectMayActClaimExecutorFactory.PROVIDER_ID, new RejectMayActClaimExecutor.Configuration(false, true, true))
+                        .build())
+                .clientPolicy(ClientPolicyBuilder.create().name("policy").condition(AnyClientConditionFactory.PROVIDER_ID, null).profile("executor").build()));
+
+        oauth.scope(null).openLoginForm();
+        oauth.fillLoginForm(USERNAME, PASSWORD);
+        res = oauth.doAccessTokenRequest(oauth.parseLoginResponse().getCode());
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertMayActPresent(oauth.verifyToken(res.getAccessToken()), administrator.getId(), null, null);
+
+        LogoutResponse logout = oauth.doLogout(res.getRefreshToken());
+        Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
+    }
+
+    @Test
+    public void rejectMayActClientPolicyConsent() {
+        addDelegationPermission();
+        createHardcodedSubMapperForAdministrator();
+
+        // default config checks consent is not granted
+        realm.updateWithCleanup(r -> r.clientProfile(ClientProfileBuilder.create().name("executor").executor(RejectMayActClaimExecutorFactory.PROVIDER_ID, null).build())
+                .clientPolicy(ClientPolicyBuilder.create().name("policy").condition(AnyClientConditionFactory.PROVIDER_ID, null).profile("executor").build()));
+
+        AccessTokenResponse res = loginWithDelegationNoEvent(null, grants -> MatcherAssert.assertThat(grants,
+                Matchers.not(Matchers.hasItem(Matchers.containsString("Delegate token")))));
+        Assertions.assertEquals(Errors.INVALID_REQUEST, res.getError());
+        Assertions.assertEquals("Invalid may_act sub in the token", res.getErrorDescription());
+
+        AccountHelper.logout(realm.admin(), USERNAME);
+
+        // explicitly do not check consents
+        realm.updateWithCleanup(r -> r.resetClientProfiles().resetClientPolicies()
+                .clientProfile(ClientProfileBuilder.create().name("executor")
+                        .executor(RejectMayActClaimExecutorFactory.PROVIDER_ID, new RejectMayActClaimExecutor.Configuration(false, false, true))
+                        .build())
+                .clientPolicy(ClientPolicyBuilder.create().name("policy").condition(AnyClientConditionFactory.PROVIDER_ID, null).profile("executor").build()));
+
+        oauth.scope(null).openLoginForm();
+        oauth.fillLoginForm(USERNAME, PASSWORD);
+        res = oauth.doAccessTokenRequest(oauth.parseLoginResponse().getCode());
+        Assertions.assertTrue(res.isSuccess(), res.getError() + " - " + res.getErrorDescription());
+        assertMayActPresent(oauth.verifyToken(res.getAccessToken()), administrator.getId(), null, null);
+
+        LogoutResponse logout = oauth.doLogout(res.getRefreshToken());
+        Assertions.assertTrue(logout.isSuccess(), logout.getError() + " - " + logout.getErrorDescription());
+    }
+
     private ScopePermissionRepresentation addDelegationPermission() {
+        return addDelegationPermission(administrator.getId(), "Administrator Policy");
+    }
+
+    private ScopePermissionRepresentation addDelegationPermission(String userId, String policyName) {
         ClientResource adminPerms = AdminApiUtil.findClientByClientId(realm.admin(), Constants.ADMIN_PERMISSIONS_CLIENT_ID);
-        UserPolicyRepresentation policy = PermissionTestUtils.createUserPolicy(realm, adminPerms, "Administrator Policy", administrator.getId());
+        UserPolicyRepresentation policy = PermissionTestUtils.createUserPolicy(realm, adminPerms, policyName, userId);
         return PermissionTestUtils.createAllPermission(adminPerms, AdminPermissionsSchema.USERS_RESOURCE_TYPE, policy, Set.of(AdminPermissionsSchema.DELEGATE));
+    }
+
+    private String recreateUserWithDelegation(String username) {
+        String newUserId = createUser(username);
+        addDelegationPermission(newUserId, "Recreated " + username + " Policy");
+        return newUserId;
+    }
+
+    private String createUser(String username) {
+        String userId;
+        try (Response response = realm.admin().users().create(
+                UserBuilder.create(username).email(username + "@localhost").build())) {
+            userId = ApiUtil.getCreatedId(response);
+        }
+        realm.cleanup().add(r -> r.users().search(username).stream()
+                .findFirst().ifPresent(u -> r.users().get(u.getId()).remove()));
+        return userId;
+    }
+
+    private String createIntrospectingClient(String clientId, String secret) {
+        ClientRepresentation clientRep = new ClientRepresentation();
+        clientRep.setClientId(clientId);
+        clientRep.setSecret(secret);
+        clientRep.setEnabled(true);
+        clientRep.setPublicClient(false);
+        clientRep.setAttributes(Map.of(OIDCConfigAttributes.ALLOW_TOKEN_INTROSPECTION_WITHOUT_AUDIENCE_CHECK, "true"));
+        String clientUuid;
+        try (Response response = realm.admin().clients().create(clientRep)) {
+            clientUuid = ApiUtil.getCreatedId(response);
+        }
+        realm.cleanup().add(r -> r.clients().get(clientUuid).remove());
+        return clientUuid;
     }
 
     private void assertExchangeError(AccessTokenResponse tokenExchangeRes, String error, String reason) {
@@ -706,6 +1151,7 @@ public class TokenExchangeDelegationTest {
                 .clientId("test-app")
                 .hasUserId()
                 .details(Details.USERNAME, USERNAME)
+                .details(Details.ACTOR_TYPE, Details.ACTOR_TYPE_USER)
                 .details(Details.ACTOR, administrator.getUsername())
                 .details(Details.ACTOR_ID, administrator.getId())
                 .details(Details.REQUESTED_TOKEN_TYPE, OAuth2Constants.ACCESS_TOKEN_TYPE)
@@ -720,7 +1166,11 @@ public class TokenExchangeDelegationTest {
         Assertions.assertTrue(introspectRes.isSuccess());
         try {
             TokenMetadataRepresentation rep = introspectRes.asTokenMetadata();
+            Assertions.assertTrue(rep.isActive());
             Assertions.assertEquals(USERNAME, rep.getUserName());
+            actValidator.accept(rep);
+            Assertions.assertEquals(teToken.getOtherClaims().get(ACT), rep.getOtherClaims().get(ACT),
+                    "Introspection should preserve the complete act claim");
         } catch (IOException e) {
             Assertions.fail(e);
         }
@@ -732,8 +1182,24 @@ public class TokenExchangeDelegationTest {
     }
 
     private AccessTokenResponse loginWithDelegation(String scope, Consumer<List<String>> grantsValidator) {
+        return loginWithDelegation(scope, grantsValidator, true);
+    }
+
+    private AccessTokenResponse loginWithDelegation(String scope, Consumer<List<String>> grantsValidator, boolean fillLoginForm) {
+        AccessTokenResponse res = loginWithDelegationNoEvent(scope, grantsValidator, fillLoginForm);
+        EventAssertion.assertSuccess(events.poll()).type(EventType.CODE_TO_TOKEN);
+        return res;
+    }
+
+    private AccessTokenResponse loginWithDelegationNoEvent(String scope, Consumer<List<String>> grantsValidator) {
+        return loginWithDelegationNoEvent(scope, grantsValidator, true);
+    }
+
+    private AccessTokenResponse loginWithDelegationNoEvent(String scope, Consumer<List<String>> grantsValidator, boolean fillLoginForm) {
         oauth.scope(scope).openLoginForm();
-        oauth.fillLoginForm(USERNAME, PASSWORD);
+        if (fillLoginForm) {
+            oauth.fillLoginForm(USERNAME, PASSWORD);
+        }
         grantPage.assertCurrent();
         List<String> grants = grantPage.getDisplayedGrants();
         grantsValidator.accept(grants);
@@ -747,9 +1213,7 @@ public class TokenExchangeDelegationTest {
                 .details(Details.CONSENT, Details.CONSENT_VALUE_CONSENT_GRANTED);
 
         String code = oauth.parseLoginResponse().getCode();
-        AccessTokenResponse res = oauth.doAccessTokenRequest(code);
-        EventAssertion.assertSuccess(events.poll()).type(EventType.CODE_TO_TOKEN);
-        return res;
+        return oauth.doAccessTokenRequest(code);
     }
 
     private String getActorToken() {
@@ -763,63 +1227,29 @@ public class TokenExchangeDelegationTest {
         return actorToken;
     }
 
-    private static void assertMayActPresent(AccessToken token, String expectedActorId) {
-        assertMayActPresent(token, expectedActorId, null, null);
-    }
-
-    @SuppressWarnings("unchecked")
-    private static void assertMayActPresent(AccessToken token, String expectedActorId, String expectedIss, String expectedUsername) {
-        Map<String, Object> mayAct = (Map<String, Object>) token.getOtherClaims().get(MAY_ACT);
-        Assertions.assertNotNull(mayAct, "may_act claim should be present");
-        Assertions.assertEquals(expectedActorId, mayAct.get(SUBJECT), "may_act.sub should contain the actor user ID");
-        if (expectedIss != null) {
-            Assertions.assertEquals(expectedIss, mayAct.get(OIDCLoginProtocol.ISSUER), "may_act.iss is not correct");
-        } else {
-            Assertions.assertNull(mayAct.get(OIDCLoginProtocol.ISSUER), "may_act.iss is not null");
-        }
-        if (expectedUsername != null) {
-            Assertions.assertEquals(expectedUsername, mayAct.get(PREFERRED_USERNAME), "may_act.preferred_username is not correct");
-        } else {
-            Assertions.assertNull(mayAct.get(PREFERRED_USERNAME), "may_act.preferred_username is not null");
-        }
-    }
-
-    private static void assertActPresent(AccessToken token, String expectedActorId, String expectedIss, String expectedUsername) {
-        Map<String, Object> act = (Map<String, Object>) token.getOtherClaims().get(ACT);
-        Assertions.assertNotNull(act, "act claim should be present");
-        Assertions.assertEquals(expectedActorId, act.get(SUBJECT), "act.sub should contain the actor user ID");
-        if (expectedIss != null) {
-            Assertions.assertEquals(expectedIss, act.get(OIDCLoginProtocol.ISSUER), "act.iss is not correct");
-        } else {
-            Assertions.assertNull(act.get(OIDCLoginProtocol.ISSUER), "act.iss is not null");
-        }
-        if (expectedUsername != null) {
-            Assertions.assertEquals(expectedUsername, act.get(PREFERRED_USERNAME), "act.preferred_username is not correct");
-        } else {
-            Assertions.assertNull(act.get(PREFERRED_USERNAME), "act.preferred_username is not null");
-        }
-    }
-
-    private static void assertMayActNotPresent(AccessToken token) {
-        Assertions.assertNull(token.getOtherClaims().get(MAY_ACT), "may_act claim should not be present");
-    }
-
     private String findDelegationScopeId() {
         return realm.admin().clientScopes().findAll().stream()
-                .filter(cs -> OIDCLoginProtocolFactory.DELEGATION_SCOPE.equals(cs.getName()))
+                .filter(cs -> OIDCLoginProtocolFactory.USER_DELEGATION_SCOPE.equals(cs.getName()))
                 .map(ClientScopeRepresentation::getId)
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("delegation client scope not found"));
     }
 
-    private static void assertScopeContains(String scopeString, String expectedScope) {
-        Assertions.assertNotNull(scopeString, "Scope string should not be null");
-        MatcherAssert.assertThat(Arrays.asList(scopeString.split(" ")), Matchers.hasItem(expectedScope));
-    }
-
-    private static void assertScopeNotContains(String scopeString, String expectedScope) {
-        Assertions.assertNotNull(scopeString, "Scope string should not be null");
-        MatcherAssert.assertThat(Arrays.asList(scopeString.split(" ")), Matchers.not(Matchers.hasItem(expectedScope)));
+    private void createHardcodedSubMapperForAdministrator() {
+        ProtocolMapperRepresentation subMapper = new ProtocolMapperRepresentation();
+        subMapper.setName("may-act-sub-mapper");
+        subMapper.setProtocol("openid-connect");
+        subMapper.setProtocolMapper("oidc-hardcoded-claim-mapper");
+        Map<String, String> config = new HashMap<>();
+        config.put(OIDCAttributeMapperHelper.TOKEN_CLAIM_NAME, "may_act.sub");
+        config.put(HardcodedClaim.CLAIM_VALUE, administrator.getId());
+        config.put(OIDCAttributeMapperHelper.JSON_TYPE, "String");
+        config.put(OIDCAttributeMapperHelper.INCLUDE_IN_ACCESS_TOKEN, Boolean.TRUE.toString());
+        subMapper.setConfig(config);
+        try (Response response = oauth.clientResource().getProtocolMappers().createMapper(subMapper)) {
+            subMapper.setId(ApiUtil.getCreatedId(response));
+        }
+        realm.cleanup().add(r -> AdminApiUtil.findClientByClientId(r, oauth.getClientId()).getProtocolMappers().delete(subMapper.getId()));
     }
 
     static class TokenExchangeDelegationServerConfig implements KeycloakServerConfig {
@@ -850,8 +1280,6 @@ public class TokenExchangeDelegationTest {
         @Override
         public ClientBuilder configure(ClientBuilder client) {
             return super.configure(client)
-                    .defaultClientScopes("acr", "basic", "email", "profile")
-                    .optionalClientScopes(OIDCLoginProtocolFactory.DELEGATION_SCOPE)
                     .consentRequired(true)
                     .attribute(OIDCConfigAttributes.STANDARD_TOKEN_EXCHANGE_ENABLED, Boolean.TRUE.toString())
                     .attribute(CibaConfig.CIBA_BACKCHANNEL_TOKEN_DELIVERY_MODE_PER_CLIENT, "ping")
@@ -888,6 +1316,15 @@ public class TokenExchangeDelegationTest {
             return client.clientId("admin-app").name("admin-app").secret("secret")
                     .directAccessGrantsEnabled()
                     .protocolMappers(audienceMapper);
+        }
+    }
+
+    static class ServiceAccountClientConfig implements ClientConfig {
+
+        @Override
+        public ClientBuilder configure(ClientBuilder client) {
+            return client.clientId("sa-app").name("Service Account App").secret("sa-secret")
+                    .serviceAccountsEnabled(true);
         }
     }
 
